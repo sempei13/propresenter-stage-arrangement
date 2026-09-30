@@ -10,6 +10,7 @@ set -euo pipefail
 LABEL="com.trinitydigitalmedia.arrangement-watch"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 OUT="${1:-$HOME/ProPresenter Stage Text/arrangement.txt}"
+# The script writes its own log; launchd only adds crash output to it.
 LOG="$(dirname "$OUT")/arrangement-watch.log"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 
@@ -30,7 +31,7 @@ cat > "$PLIST" <<EOF
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>$LOG</string>
+  <key>StandardOutPath</key><string>/dev/null</string>
   <key>StandardErrorPath</key><string>$LOG</string>
 </dict>
 </plist>

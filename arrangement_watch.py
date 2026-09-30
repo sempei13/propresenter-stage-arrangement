@@ -11,6 +11,9 @@ What gets written:
   - Non-song presentation live (sermon, etc.)   -> blank
   - Nothing live, or triggered from the library -> blank
 
+Works on macOS and Windows. Logs to arrangement-watch.log next to the output
+file. Set PROPRESENTER_PORT to skip automatic port detection.
+
 Usage: arrangement_watch.py [output_file]
 """
 import json
@@ -23,6 +26,8 @@ import urllib.request
 
 OUT = os.path.expanduser(
     sys.argv[1] if len(sys.argv) > 1 else "~/ProPresenter Stage Text/arrangement.txt")
+LOG = os.path.join(os.path.dirname(OUT), "arrangement-watch.log")
+WINDOWS = sys.platform == "win32"
 DEFAULT_TEXT = "Default"
 BLANK_TEXT = ""
 POLL_SECONDS = 1
@@ -35,24 +40,59 @@ SONG_GROUP = re.compile(
 
 
 def log(msg):
-    print(time.strftime("%Y-%m-%d %-I:%M:%S %p"), msg, flush=True)
+    # %-I (no leading zero) doesn't exist on Windows, so strip the zero by hand.
+    stamp = time.strftime("%Y-%m-%d %I:%M:%S %p").replace(" 0", " ", 1)
+    line = f"{stamp} {msg}"
+    try:
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+    if sys.stdout:  # pythonw on Windows has no console
+        print(line, flush=True)
+
+
+def run(cmd):
+    kw = {"creationflags": 0x08000000} if WINDOWS else {}  # CREATE_NO_WINDOW
+    return subprocess.run(cmd, capture_output=True, text=True, **kw).stdout
+
+
+def mac_ports(lsof_out):
+    return [m.group(1) for line in lsof_out.splitlines() if line.startswith("ProPresen")
+            for m in [re.search(r":(\d+) \(LISTEN\)", line)] if m]
+
+
+def windows_ports(tasklist_out, netstat_out):
+    pids = {row[1] for row in (l.strip('"').split('","') for l in tasklist_out.splitlines())
+            if len(row) > 1 and row[0].lower().startswith("propresenter")}
+    ports = []
+    for line in netstat_out.splitlines():
+        parts = line.split()
+        # A listening socket has no remote end (0.0.0.0:0 / [::]:0). Checking that
+        # instead of the word "LISTENING" works on non-English Windows too.
+        if (len(parts) == 5 and parts[0] == "TCP" and parts[2] in ("0.0.0.0:0", "[::]:0")
+                and parts[4] in pids):
+            ports.append(parts[1].rsplit(":", 1)[1])
+    return ports
+
+
+def candidate_ports():
+    if os.environ.get("PROPRESENTER_PORT"):
+        return [os.environ["PROPRESENTER_PORT"]]
+    if WINDOWS:
+        return windows_ports(run(["tasklist", "/FO", "CSV", "/NH"]),
+                             run(["netstat", "-ano", "-p", "TCP"]))
+    return mac_ports(run(["/usr/sbin/lsof", "-nP", "-iTCP", "-sTCP:LISTEN"]))
 
 
 def find_port():
     """ProPresenter's API port isn't fixed, so find it by asking each port
     ProPresenter is listening on for /version."""
-    out = subprocess.run(["/usr/sbin/lsof", "-nP", "-iTCP", "-sTCP:LISTEN"],
-                         capture_output=True, text=True).stdout
-    for line in out.splitlines():
-        if not line.startswith("ProPresen"):
-            continue
-        m = re.search(r":(\d+) \(LISTEN\)", line)
-        if not m:
-            continue
+    for port in dict.fromkeys(candidate_ports()):
         try:
-            with urllib.request.urlopen(f"http://localhost:{m.group(1)}/version", timeout=1) as r:
+            with urllib.request.urlopen(f"http://localhost:{port}/version", timeout=1) as r:
                 if "api_version" in r.read().decode():
-                    return m.group(1)
+                    return port
         except Exception:
             pass
     return None
@@ -112,7 +152,7 @@ def current_text(port):
 def write(text):
     # Overwrite the same file in place. Replacing it with a new file (the usual
     # "atomic write") can break ProPresenter's link to it.
-    with open(OUT, "w") as f:
+    with open(OUT, "w", encoding="utf-8") as f:
         f.write(text)
 
 
@@ -122,7 +162,10 @@ def main():
     port, last, waiting = None, None, False
     while True:
         if not port:
-            port = find_port()
+            try:
+                port = find_port()
+            except Exception as e:
+                log(f"port lookup failed ({e})")
             if not port:
                 if not waiting:
                     log("waiting for ProPresenter")
@@ -135,13 +178,21 @@ def main():
             log(f"ProPresenter API on port {port}")
         try:
             text, song = current_text(port)
-            if text != last:
-                write(text)
-                log(f"live: {song!r} -> wrote {text!r}")
-                last = text
         except Exception as e:
             log(f"lost ProPresenter ({e}); looking for it again")
             port = None
+            time.sleep(POLL_SECONDS)
+            continue
+        if text != last:
+            try:
+                write(text)
+            except OSError as e:
+                # Windows can refuse the write while ProPresenter has the file
+                # open. Leave `last` alone so the next check tries again.
+                log(f"couldn't write {OUT} ({e}); retrying")
+            else:
+                log(f"live: {song!r} -> wrote {text!r}")
+                last = text
         time.sleep(POLL_SECONDS)
 
 
